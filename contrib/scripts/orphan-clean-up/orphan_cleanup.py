@@ -8,10 +8,12 @@ URL is provided.
 """
 
 import argparse
+import csv
 import json
 import sys
 import urllib.error
 import urllib.request
+from datetime import datetime
 from typing import Any, Dict, List
 
 
@@ -56,6 +58,46 @@ def delete_orphan(base_url: str, uid: str, headers: Dict[str, str]) -> None:
         raise RuntimeError(f"Failed to reach {url}: {err.reason}") from err
 
 
+def build_entity_row(entity: Dict[str, Any]) -> Dict[str, str]:
+    metadata = entity.get("metadata", {}) or {}
+    spec = entity.get("spec", {}) or {}
+    annotations = metadata.get("annotations", {}) or {}
+
+    name = metadata.get("name", "<unknown>")
+    kind = entity.get("kind", "<unknown>")
+    owner = spec.get("owner") or annotations.get("backstage.io/owner") or annotations.get("backstage.io/owned-by") or "<unknown>"
+    tags_raw = metadata.get("tags") or []
+    tags = ";".join(sorted(str(tag) for tag in tags_raw)) if isinstance(tags_raw, list) else str(tags_raw)
+    location = (
+        annotations.get("backstage.io/origin-location")
+        or annotations.get("backstage.io/managed-by-location")
+        or annotations.get("backstage.io/location")
+        or "<unknown>"
+    )
+
+    return {
+        "name": str(name),
+        "kind": str(kind),
+        "owner": str(owner),
+        "tags": tags,
+        "location": str(location),
+    }
+
+
+def write_csv(rows: List[Dict[str, str]], dry_run: bool) -> str:
+    timestamp = datetime.now().strftime("%Y%m%d-%H%M")
+    prefix = "backstage-dry-run-orphaned-entities-deleted" if dry_run else "backstage-orphaned-entities-deleted"
+    filename = f"{prefix}-{timestamp}.csv"
+
+    sorted_rows = sorted(rows, key=lambda row: (row["name"].lower(), row["kind"].lower()))
+    with open(filename, "w", newline="") as csvfile:
+        writer = csv.DictWriter(csvfile, fieldnames=["name", "kind", "owner", "tags", "location"])
+        writer.writeheader()
+        writer.writerows(sorted_rows)
+
+    return filename
+
+
 def main(argv: List[str]) -> int:
     parser = argparse.ArgumentParser(description="Delete orphaned Backstage catalog entities.")
     parser.add_argument(
@@ -75,6 +117,11 @@ def main(argv: List[str]) -> int:
         "-n",
         action="store_true",
         help="Show orphan entities without deleting them",
+    )
+    parser.add_argument(
+        "--csv-output",
+        action="store_true",
+        help="Write deleted (or would-be deleted) entities to CSV",
     )
     args = parser.parse_args(argv)
 
@@ -96,6 +143,8 @@ def main(argv: List[str]) -> int:
     if not orphans:
         return 0
 
+    csv_rows: List[Dict[str, str]] = []
+
     for orphan in orphans:
         print(json.dumps(orphan, indent=2))
         name = orphan.get("metadata", {}).get("name", "<unknown>")
@@ -105,8 +154,12 @@ def main(argv: List[str]) -> int:
             print(f"Skipping entity {name} of kind {kind}: missing uid", file=sys.stderr)
             continue
 
+        row = build_entity_row(orphan) if args.csv_output else None
+
         if args.dry_run:
             print(f"Dry-run: would delete orphan entity: {name} of kind: {kind}")
+            if row:
+                csv_rows.append(row)
             continue
 
         print(f"Deleting orphan entity: {name} of kind: {kind}")
@@ -114,6 +167,14 @@ def main(argv: List[str]) -> int:
             delete_orphan(base_url, uid, headers)
         except RuntimeError as err:
             print(err, file=sys.stderr)
+            continue
+
+        if row:
+            csv_rows.append(row)
+
+    if args.csv_output:
+        filename = write_csv(csv_rows, args.dry_run)
+        print(f"Wrote CSV to {filename}")
 
     return 0
 
